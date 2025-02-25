@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -23,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	"github.com/stretchr/testify/require"
 
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -49,7 +52,8 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 		}
 
 		bwr := metrics.NewBandwidthCounter()
-		netw, err := swarm.NewSwarm(p, ps, eventbus.NewBus(), swarm.WithMetrics(bwr))
+		bus := eventbus.NewBus()
+		netw, err := swarm.NewSwarm(p, ps, bus, swarm.WithMetrics(bwr))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,7 +61,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 		upgrader := swarmt.GenUpgrader(t, netw, nil)
 		upgraders = append(upgraders, upgrader)
 
-		tpt, err := tcp.NewTCPTransport(upgrader, nil)
+		tpt, err := tcp.NewTCPTransport(upgrader, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +74,7 @@ func getNetHosts(t *testing.T, ctx context.Context, n int) (hosts []host.Host, u
 			t.Fatal(err)
 		}
 
-		h := bhost.NewBlankHost(netw)
+		h := bhost.NewBlankHost(netw, bhost.WithEventBus(bus))
 
 		hosts = append(hosts, h)
 	}
@@ -145,20 +149,41 @@ func TestBasicRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sub, err := hosts[2].EventBus().Subscribe(new(event.EvtPeerConnectednessChanged))
+	require.NoError(t, err)
+
 	err = hosts[2].Connect(ctx, peer.AddrInfo{ID: hosts[0].ID(), Addrs: []ma.Multiaddr{raddr}})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for {
+		var e interface{}
+		select {
+		case e = <-sub.Out():
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected limited connectivity event")
+		}
+		evt, ok := e.(event.EvtPeerConnectednessChanged)
+		if !ok {
+			t.Fatalf("invalid event: %s", e)
+		}
+		if evt.Peer == hosts[0].ID() {
+			if evt.Connectedness != network.Limited {
+				t.Fatalf("expected limited connectivity %s", evt.Connectedness)
+			}
+			break
+		}
 	}
 
 	conns := hosts[2].Network().ConnsToPeer(hosts[0].ID())
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,11 +254,11 @@ func TestRelayLimitTime(t *testing.T) {
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,12 +268,12 @@ func TestRelayLimitTime(t *testing.T) {
 	if n > 0 {
 		t.Fatalf("expected to write 0 bytes, wrote %d", n)
 	}
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 
 	err = <-rch
-	if err != network.ErrReset {
+	if !errors.Is(err, network.ErrReset) {
 		t.Fatalf("expected reset, but got %s", err)
 	}
 }
@@ -276,7 +301,7 @@ func TestRelayLimitData(t *testing.T) {
 		}
 
 		n, err := s.Read(buf)
-		if err != network.ErrReset {
+		if !errors.Is(err, network.ErrReset) {
 			t.Fatalf("expected reset but got %s", err)
 		}
 		rch <- n
@@ -315,11 +340,11 @@ func TestRelayLimitData(t *testing.T) {
 	if len(conns) != 1 {
 		t.Fatalf("expected 1 connection, but got %d", len(conns))
 	}
-	if !conns[0].Stat().Transient {
+	if !conns[0].Stat().Limited {
 		t.Fatal("expected transient connection")
 	}
 
-	s, err := hosts[2].NewStream(network.WithUseTransient(ctx, "test"), hosts[0].ID(), "test")
+	s, err := hosts[2].NewStream(network.WithAllowLimitedConn(ctx, "test"), hosts[0].ID(), "test")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,15 +2,16 @@ package basichost
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p-testing/race"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -24,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multiaddr/matest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,7 +86,15 @@ func TestMultipleClose(t *testing.T) {
 
 	require.NoError(t, h.Close())
 	require.NoError(t, h.Close())
-	require.NoError(t, h.Close())
+	h2, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	defer h2.Close()
+	require.Error(t, h.Connect(context.Background(), peer.AddrInfo{ID: h2.ID(), Addrs: h2.Addrs()}))
+	h.Network().Peerstore().AddAddrs(h2.ID(), h2.Addrs(), peerstore.PermanentAddrTTL)
+	_, err = h.NewStream(context.Background(), h2.ID())
+	require.Error(t, err)
+	require.Empty(t, h.Addrs())
+	require.Empty(t, h.AllAddrs())
 }
 
 func TestSignedPeerRecordWithNoListenAddrs(t *testing.T) {
@@ -241,6 +251,63 @@ func TestAllAddrs(t *testing.T) {
 	require.True(t, ma.Contains(h.AllAddrs(), firstAddr), "should still contain the original addr")
 }
 
+func TestAllAddrsUnique(t *testing.T) {
+	if race.WithRace() {
+		t.Skip("updates addrChangeTickrInterval which might be racy")
+	}
+	oldInterval := addrChangeTickrInterval
+	addrChangeTickrInterval = 100 * time.Millisecond
+	defer func() {
+		addrChangeTickrInterval = oldInterval
+	}()
+	sendNewAddrs := make(chan struct{})
+	opts := HostOpts{
+		AddrsFactory: func(addrs []ma.Multiaddr) []ma.Multiaddr {
+			select {
+			case <-sendNewAddrs:
+				return []ma.Multiaddr{
+					ma.StringCast("/ip4/1.2.3.4/tcp/1"),
+					ma.StringCast("/ip4/1.2.3.4/tcp/1"),
+					ma.StringCast("/ip4/1.2.3.4/tcp/1"),
+					ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1"),
+					ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1"),
+				}
+			default:
+				return nil
+			}
+		},
+	}
+	// no listen addrs
+	h, err := NewHost(swarmt.GenSwarm(t, swarmt.OptDialOnly), &opts)
+	require.NoError(t, err)
+	defer h.Close()
+	h.Start()
+
+	sub, err := h.EventBus().Subscribe(&event.EvtLocalAddressesUpdated{})
+	require.NoError(t, err)
+	out := make(chan int)
+	done := make(chan struct{})
+	go func() {
+		cnt := 0
+		for {
+			select {
+			case <-sub.Out():
+				cnt++
+			case <-done:
+				out <- cnt
+				return
+			}
+		}
+	}()
+	close(sendNewAddrs)
+	require.Len(t, h.Addrs(), 2)
+	matest.AssertEqualMultiaddrs(t, []ma.Multiaddr{ma.StringCast("/ip4/1.2.3.4/tcp/1"), ma.StringCast("/ip4/1.2.3.4/udp/1/quic-v1")}, h.Addrs())
+	time.Sleep(2*addrChangeTickrInterval + 1*time.Second) // the background loop runs every 5 seconds. Wait for 2x that time.
+	close(done)
+	cnt := <-out
+	require.Equal(t, 1, cnt)
+}
+
 // getHostPair gets a new pair of hosts.
 // The first host initiates the connection to the second host.
 func getHostPair(t *testing.T) (host.Host, host.Host) {
@@ -377,7 +444,7 @@ func TestHostProtoPreknowledge(t *testing.T) {
 
 	// This test implicitly relies on 1 connection. If a background identify
 	// completes after we set the stream handler below things break
-	require.Equal(t, 1, len(h1.Network().ConnsToPeer(h2.ID())))
+	require.Len(t, h1.Network().ConnsToPeer(h2.ID()), 1)
 
 	// wait for identify handshake to finish completely
 	select {
@@ -469,7 +536,7 @@ func TestNewStreamResolve(t *testing.T) {
 			break
 		}
 	}
-	assert.NotEqual(t, dialAddr, "")
+	assert.NotEqual(t, "", dialAddr)
 
 	// Add the DNS multiaddr to h1's peerstore.
 	maddr, err := ma.NewMultiaddr(dialAddr)
@@ -506,7 +573,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "bar")
+		assert.Equal(t, "bar", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -527,7 +594,7 @@ func TestProtoDowngrade(t *testing.T) {
 		defer s.Close()
 		result, err := io.ReadAll(s)
 		assert.NoError(t, err)
-		assert.Equal(t, string(result), "foo")
+		assert.Equal(t, "foo", string(result))
 		connectedOn <- s.Protocol()
 	})
 
@@ -584,13 +651,13 @@ func TestAddrChangeImmediatelyIfAddressNonEmpty(t *testing.T) {
 
 	// assert it's on the signed record
 	rc := peerRecordFromEnvelope(t, evt.SignedPeerRecord)
-	require.Equal(t, taddrs, rc.Addrs)
+	matest.AssertEqualMultiaddrs(t, taddrs, rc.Addrs)
 
 	// assert it's in the peerstore
 	ev := h.Peerstore().(peerstore.CertifiedAddrBook).GetPeerRecord(h.ID())
 	require.NotNil(t, ev)
 	rc = peerRecordFromEnvelope(t, ev)
-	require.Equal(t, taddrs, rc.Addrs)
+	matest.AssertEqualMultiaddrs(t, taddrs, rc.Addrs)
 }
 
 func TestStatefulAddrEvents(t *testing.T) {
@@ -693,13 +760,13 @@ func TestHostAddrChangeDetection(t *testing.T) {
 
 		// assert it's on the signed record
 		rc := peerRecordFromEnvelope(t, evt.SignedPeerRecord)
-		require.Equal(t, addrSets[i], rc.Addrs)
+		matest.AssertMultiaddrsMatch(t, addrSets[i], rc.Addrs)
 
 		// assert it's in the peerstore
 		ev := h.Peerstore().(peerstore.CertifiedAddrBook).GetPeerRecord(h.ID())
 		require.NotNil(t, ev)
 		rc = peerRecordFromEnvelope(t, ev)
-		require.Equal(t, addrSets[i], rc.Addrs)
+		matest.AssertMultiaddrsMatch(t, addrSets[i], rc.Addrs)
 	}
 }
 
@@ -825,74 +892,107 @@ func TestNormalizeMultiaddr(t *testing.T) {
 	require.Equal(t, "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", h1.NormalizeMultiaddr(ma.StringCast("/ip4/1.2.3.4/udp/9999/quic-v1/webtransport/certhash/uEgNmb28")).String())
 }
 
-func TestInferWebtransportAddrsFromQuic(t *testing.T) {
+func TestTrimHostAddrList(t *testing.T) {
 	type testCase struct {
-		name string
-		in   []string
-		out  []string
+		name      string
+		in        []ma.Multiaddr
+		threshold int
+		out       []ma.Multiaddr
 	}
+
+	tcpPublic := ma.StringCast("/ip4/1.1.1.1/tcp/1")
+	quicPublic := ma.StringCast("/ip4/1.1.1.1/udp/1/quic-v1")
+
+	tcpPrivate := ma.StringCast("/ip4/192.168.1.1/tcp/1")
+	quicPrivate := ma.StringCast("/ip4/192.168.1.1/udp/1/quic-v1")
+
+	tcpLocal := ma.StringCast("/ip4/127.0.0.1/tcp/1")
+	quicLocal := ma.StringCast("/ip4/127.0.0.1/udp/1/quic-v1")
 
 	testCases := []testCase{
 		{
-			name: "Happy Path",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+			name:      "Public preferred over private",
+			in:        []ma.Multiaddr{tcpPublic, quicPrivate},
+			threshold: len(tcpLocal.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic},
 		},
 		{
-			name: "Happy Path With CertHashes",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport/certhash/uEgNmb28/certhash/uEgNmb28", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+			name:      "Public and private preffered over local",
+			in:        []ma.Multiaddr{tcpPublic, tcpPrivate, quicLocal},
+			threshold: len(tcpPublic.Bytes()) + len(tcpPrivate.Bytes()),
+			out:       []ma.Multiaddr{tcpPublic, tcpPrivate},
 		},
 		{
-			name: "Already discovered",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport"},
+			name:      "quic preferred over tcp",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic},
+			threshold: len(quicPublic.Bytes()),
+			out:       []ma.Multiaddr{quicPublic},
 		},
 		{
-			name: "Infer Many",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/4.3.2.1/udp/9999/quic-v1"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/9999/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1", "/ip4/4.3.2.1/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1/webtransport", "/ip4/4.3.2.1/udp/9999/quic-v1/webtransport"},
+			name:      "no filtering on large threshold",
+			in:        []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
+			threshold: 10000,
+			out:       []ma.Multiaddr{tcpPublic, quicPublic, quicLocal, tcpLocal, tcpPrivate},
 		},
-		{
-			name: "No Common listeners",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/1111/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/0.0.0.0/udp/1111/quic-v1/webtransport", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-		},
-		{
-			name: "No WebTransport",
-			in:   []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-			out:  []string{"/ip4/0.0.0.0/udp/9999/quic-v1", "/ip4/1.2.3.4/udp/9999/quic-v1"},
-		},
-	}
-
-	// Make sure the testCases are all valid multiaddrs
-	for _, tc := range testCases {
-		for _, addr := range tc.in {
-			_, err := ma.NewMultiaddr(addr)
-			require.NoError(t, err)
-		}
-		for _, addr := range tc.out {
-			_, err := ma.NewMultiaddr(addr)
-			require.NoError(t, err)
-		}
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			sort.StringSlice(tc.in).Sort()
-			sort.StringSlice(tc.out).Sort()
-			min := make([]ma.Multiaddr, 0, len(tc.in))
-			for _, addr := range tc.in {
-				min = append(min, ma.StringCast(addr))
-			}
-			outMa := inferWebtransportAddrsFromQuic(min)
-			outStr := make([]string, 0, len(outMa))
-			for _, addr := range outMa {
-				outStr = append(outStr, addr.String())
-			}
-			require.Equal(t, tc.out, outStr)
+			got := trimHostAddrList(tc.in, tc.threshold)
+			require.ElementsMatch(t, got, tc.out)
 		})
-
 	}
+}
 
+func TestHostTimeoutNewStream(t *testing.T) {
+	h1, err := NewHost(swarmt.GenSwarm(t), nil)
+	require.NoError(t, err)
+	h1.Start()
+	defer h1.Close()
+
+	const proto = "/testing"
+	h2 := swarmt.GenSwarm(t)
+
+	h2.SetStreamHandler(func(s network.Stream) {
+		// First message is multistream header. Just echo it
+		msHeader := []byte("\x19/multistream/1.0.0\n")
+		_, err := s.Read(msHeader)
+		assert.NoError(t, err)
+		_, err = s.Write(msHeader)
+		assert.NoError(t, err)
+
+		buf := make([]byte, 1024)
+		n, err := s.Read(buf)
+		assert.NoError(t, err)
+
+		msgLen, varintN := binary.Uvarint(buf[:n])
+		buf = buf[varintN:]
+		proto := buf[:int(msgLen)]
+		if string(proto) == "/ipfs/id/1.0.0\n" {
+			// Signal we don't support identify
+			na := []byte("na\n")
+			n := binary.PutUvarint(buf, uint64(len(na)))
+			copy(buf[n:], na)
+
+			_, err = s.Write(buf[:int(n)+len(na)])
+			assert.NoError(t, err)
+		} else {
+			// Stall
+			time.Sleep(5 * time.Second)
+		}
+		t.Log("Resetting")
+		s.Reset()
+	})
+
+	err = h1.Connect(context.Background(), peer.AddrInfo{
+		ID:    h2.LocalPeer(),
+		Addrs: h2.ListenAddresses(),
+	})
+	require.NoError(t, err)
+
+	// No context passed in, fallback to negtimeout
+	h1.negtimeout = time.Second
+	_, err = h1.NewStream(context.Background(), h2.LocalPeer(), proto)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "context deadline exceeded")
 }

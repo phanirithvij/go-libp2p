@@ -84,7 +84,7 @@ func makeSwarmWithNoListenAddrs(t *testing.T, opts ...Option) *Swarm {
 	upgrader := makeUpgrader(t, s)
 	var tcpOpts []tcp.Option
 	tcpOpts = append(tcpOpts, tcp.DisableReuseport())
-	tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, tcpOpts...)
+	tcpTransport, err := tcp.NewTCPTransport(upgrader, nil, nil, tcpOpts...)
 	require.NoError(t, err)
 	if err := s.AddTransport(tcpTransport); err != nil {
 		t.Fatal(err)
@@ -401,9 +401,10 @@ func TestDialQueueNextBatch(t *testing.T) {
 		addrs = append(addrs, ma.StringCast(fmt.Sprintf("/ip4/1.2.3.4/tcp/%d", i)))
 	}
 	testcase := []struct {
-		name   string
-		input  []network.AddrDelay
-		output [][]ma.Multiaddr
+		name       string
+		input      []network.AddrDelay
+		output     [][]ma.Multiaddr
+		hasUpdates bool
 	}{
 		{
 			name: "next batch",
@@ -456,6 +457,7 @@ func TestDialQueueNextBatch(t *testing.T) {
 				{addrs[4]},
 				{},
 			},
+			hasUpdates: true,
 		},
 		{
 			name:  "null input",
@@ -470,7 +472,11 @@ func TestDialQueueNextBatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			q := newDialQueue()
 			for i := 0; i < len(tc.input); i++ {
-				q.Add(tc.input[i])
+				if tc.hasUpdates {
+					q.UpdateOrAdd(tc.input[i])
+				} else {
+					q.Add(tc.input[i])
+				}
 			}
 			for _, batch := range tc.output {
 				b := q.NextBatch()
@@ -572,11 +578,11 @@ func checkDialWorkerLoopScheduling(t *testing.T, s1, s2 *Swarm, tc schedulingTes
 	// failDials is used to track dials which should fail in the future
 	// at appropriate moment a message is sent to dialState.ch to trigger
 	// failure
-	failDials := make(map[ma.Multiaddr]dialState)
+	failDials := make(map[*ma.Multiaddr]dialState)
 	// recvCh is used to receive dial notifications for dials that will fail
 	recvCh := make(chan struct{}, 100)
 	// allDials tracks all pending dials
-	allDials := make(map[ma.Multiaddr]dialState)
+	allDials := make(map[*ma.Multiaddr]dialState)
 	// addrs are the peer addresses the swarm will use for dialing
 	addrs := make([]ma.Multiaddr, 0)
 	// create pending dials
@@ -604,7 +610,7 @@ func checkDialWorkerLoopScheduling(t *testing.T, s1, s2 *Swarm, tc schedulingTes
 		}
 		addrs = append(addrs, inp.addr)
 		// add to pending dials
-		allDials[inp.addr] = dialState{
+		allDials[&inp.addr] = dialState{
 			ch:        failCh,
 			addr:      inp.addr,
 			delay:     inp.delay,
@@ -689,7 +695,7 @@ loop:
 					failDials[a] = dialState{
 						ch:     ds.ch,
 						failAt: cl.Now().Add(ds.failAfter),
-						addr:   a,
+						addr:   *a,
 						delay:  ds.delay,
 					}
 				}
@@ -1139,4 +1145,52 @@ func TestDialWorkerLoopTCPConnUpgradeWait(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Errorf("expected a fail response")
 	}
+}
+
+func BenchmarkDialRanker(b *testing.B) {
+	const N = 10000
+
+	benchDialQueue := func(adelays []network.AddrDelay) {
+		dq := newDialQueue()
+		for _, a := range adelays {
+			dq.Add(a)
+		}
+		for {
+			batch := dq.NextBatch()
+			if len(batch) == 0 {
+				return
+			}
+		}
+	}
+	addrs := make([]ma.Multiaddr, N)
+	for i := 0; i < N; i++ {
+		addrs[i] = ma.StringCast(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", i))
+	}
+
+	b.Run("equal delay", func(b *testing.B) {
+		b.ReportAllocs()
+		addrDelays := make([]network.AddrDelay, N)
+		for i := 0; i < N; i++ {
+			addrDelays[i] = network.AddrDelay{
+				Addr:  addrs[i],
+				Delay: 0,
+			}
+		}
+		for i := 0; i < b.N; i++ {
+			benchDialQueue(addrDelays)
+		}
+	})
+	b.Run("sorted delay", func(b *testing.B) {
+		b.ReportAllocs()
+		addrDelays := make([]network.AddrDelay, N)
+		for i := 0; i < N; i++ {
+			addrDelays[i] = network.AddrDelay{
+				Addr:  addrs[i],
+				Delay: time.Millisecond * time.Duration(i),
+			}
+		}
+		for i := 0; i < b.N; i++ {
+			benchDialQueue(addrDelays)
+		}
+	})
 }

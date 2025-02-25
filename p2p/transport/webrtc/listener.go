@@ -20,9 +20,7 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/multiformats/go-multibase"
 	"github.com/multiformats/go-multihash"
-	pionlogger "github.com/pion/logging"
-	"github.com/pion/webrtc/v3"
-	"go.uber.org/zap/zapcore"
+	"github.com/pion/webrtc/v4"
 )
 
 type connMultiaddrs struct {
@@ -35,8 +33,12 @@ func (c *connMultiaddrs) LocalMultiaddr() ma.Multiaddr  { return c.local }
 func (c *connMultiaddrs) RemoteMultiaddr() ma.Multiaddr { return c.remote }
 
 const (
-	candidateSetupTimeout         = 20 * time.Second
-	DefaultMaxInFlightConnections = 10
+	candidateSetupTimeout = 10 * time.Second
+	// This is higher than other transports(64) as there's no way to detect a peer that has gone away after
+	// sending the initial connection request message(STUN Binding request). Such peers take up a goroutine
+	// till connection timeout. As the number of handshakes in parallel is still guarded by the resource
+	// manager, this higher number is okay.
+	DefaultMaxInFlightConnections = 128
 )
 
 type listener struct {
@@ -57,6 +59,7 @@ type listener struct {
 	// used to control the lifecycle of the listener
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 var _ tpt.Listener = &listener{}
@@ -91,30 +94,27 @@ func newListener(transport *WebRTCTransport, laddr ma.Multiaddr, socket net.Pack
 	}
 
 	l.ctx, l.cancel = context.WithCancel(context.Background())
-	mux := udpmux.NewUDPMux(socket)
-	l.mux = mux
-	mux.Start()
+	l.mux = udpmux.NewUDPMux(socket)
+	l.mux.Start()
 
-	go l.listen()
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.listen()
+	}()
 
 	return l, err
 }
 
 func (l *listener) listen() {
-	// Accepting a connection requires instantiating a peerconnection
-	// and a noise connection which is expensive. We therefore limit
-	// the number of in-flight connection requests. A connection
-	// is considered to be in flight from the instant it is handled
-	// until it is dequeued by a call to Accept, or errors out in some
-	// way.
-	inFlightQueueCh := make(chan struct{}, l.transport.maxInFlightConnections)
-	for i := uint32(0); i < l.transport.maxInFlightConnections; i++ {
-		inFlightQueueCh <- struct{}{}
-	}
-
+	// Accepting a connection requires instantiating a peerconnection and a noise connection
+	// which is expensive. We therefore limit the number of in-flight connection requests. A
+	// connection is considered to be in flight from the instant it is handled until it is
+	// dequeued by a call to Accept, or errors out in some way.
+	inFlightSemaphore := make(chan struct{}, l.transport.maxInFlightConnections)
 	for {
 		select {
-		case <-inFlightQueueCh:
+		case inFlightSemaphore <- struct{}{}:
 		case <-l.ctx.Done():
 			return
 		}
@@ -128,7 +128,7 @@ func (l *listener) listen() {
 		}
 
 		go func() {
-			defer func() { inFlightQueueCh <- struct{}{} }() // free this spot once again
+			defer func() { <-inFlightSemaphore }()
 
 			ctx, cancel := context.WithTimeout(l.ctx, candidateSetupTimeout)
 			defer cancel()
@@ -141,11 +141,11 @@ func (l *listener) listen() {
 			}
 
 			select {
-			case <-ctx.Done():
-				log.Warn("could not push connection: ctx done")
+			case <-l.ctx.Done():
+				log.Debug("dropping connection, listener closed")
 				conn.Close()
 			case l.acceptQueue <- conn:
-				// acceptQueue is an unbuffered channel, so this block until the connection is accepted.
+				// acceptQueue is an unbuffered channel, so this blocks until the connection is accepted.
 			}
 		}()
 	}
@@ -184,11 +184,11 @@ func (l *listener) setupConnection(
 	ctx context.Context, scope network.ConnManagementScope,
 	remoteMultiaddr ma.Multiaddr, candidate udpmux.Candidate,
 ) (tConn tpt.CapableConn, err error) {
-	var pc *webrtc.PeerConnection
+	var w webRTCConnection
 	defer func() {
 		if err != nil {
-			if pc != nil {
-				_ = pc.Close()
+			if w.PeerConnection != nil {
+				_ = w.PeerConnection.Close()
 			}
 			if tConn != nil {
 				_ = tConn.Close()
@@ -196,21 +196,7 @@ func (l *listener) setupConnection(
 		}
 	}()
 
-	loggerFactory := pionlogger.NewDefaultLoggerFactory()
-	pionLogLevel := pionlogger.LogLevelDisabled
-	switch log.Level() {
-	case zapcore.DebugLevel:
-		pionLogLevel = pionlogger.LogLevelDebug
-	case zapcore.InfoLevel:
-		pionLogLevel = pionlogger.LogLevelInfo
-	case zapcore.WarnLevel:
-		pionLogLevel = pionlogger.LogLevelWarn
-	case zapcore.ErrorLevel:
-		pionLogLevel = pionlogger.LogLevelError
-	}
-	loggerFactory.DefaultLogLevel = pionLogLevel
-
-	settingEngine := webrtc.SettingEngine{LoggerFactory: loggerFactory}
+	settingEngine := webrtc.SettingEngine{LoggerFactory: pionLoggerFactory}
 	settingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleServer)
 	settingEngine.SetICECredentials(candidate.Ufrag, candidate.Ufrag)
 	settingEngine.SetLite(true)
@@ -222,36 +208,34 @@ func (l *listener) setupConnection(
 		l.transport.peerConnectionTimeouts.Failed,
 		l.transport.peerConnectionTimeouts.Keepalive,
 	)
+	// This is higher than the path MTU due to a bug in the sctp chunking logic.
+	// Remove this after https://github.com/pion/sctp/pull/301 is included
+	// in a release.
+	settingEngine.SetReceiveMTU(udpmux.ReceiveBufSize)
 	settingEngine.DetachDataChannels()
-
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
-	pc, err = api.NewPeerConnection(l.config)
-	if err != nil {
+	settingEngine.SetSCTPMaxReceiveBufferSize(sctpReceiveBufferSize)
+	if err := scope.ReserveMemory(sctpReceiveBufferSize, network.ReservationPriorityMedium); err != nil {
 		return nil, err
 	}
 
-	negotiated, id := handshakeChannelNegotiated, handshakeChannelID
-	rawDatachannel, err := pc.CreateDataChannel("", &webrtc.DataChannelInit{
-		Negotiated: &negotiated,
-		ID:         &id,
-	})
+	w, err = newWebRTCConnection(settingEngine, l.config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("instantiating peer connection failed: %w", err)
 	}
 
-	errC := addOnConnectionStateChangeCallback(pc)
+	errC := addOnConnectionStateChangeCallback(w.PeerConnection)
 	// Infer the client SDP from the incoming STUN message by setting the ice-ufrag.
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+	if err := w.PeerConnection.SetRemoteDescription(webrtc.SessionDescription{
 		SDP:  createClientSDP(candidate.Addr, candidate.Ufrag),
 		Type: webrtc.SDPTypeOffer,
 	}); err != nil {
 		return nil, err
 	}
-	answer, err := pc.CreateAnswer(nil)
+	answer, err := w.PeerConnection.CreateAnswer(nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := pc.SetLocalDescription(answer); err != nil {
+	if err := w.PeerConnection.SetLocalDescription(answer); err != nil {
 		return nil, err
 	}
 
@@ -264,34 +248,14 @@ func (l *listener) setupConnection(
 		}
 	}
 
-	rwc, err := getDetachedChannel(ctx, rawDatachannel)
+	// Run the noise handshake.
+	rwc, err := detachHandshakeDataChannel(ctx, w.HandshakeDataChannel)
 	if err != nil {
 		return nil, err
 	}
-
-	localMultiaddrWithoutCerthash, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
-
-	handshakeChannel := newStream(rawDatachannel, rwc, func() {})
-	// The connection is instantiated before performing the Noise handshake. This is
-	// to handle the case where the remote is faster and attempts to initiate a stream
-	// before the ondatachannel callback can be set.
-	conn, err := newConnection(
-		network.DirInbound,
-		pc,
-		l.transport,
-		scope,
-		l.transport.localPeerId,
-		localMultiaddrWithoutCerthash,
-		"",  // remotePeer
-		nil, // remoteKey
-		remoteMultiaddr,
-	)
-	if err != nil {
-		return nil, err
-	}
-
+	handshakeChannel := newStream(w.HandshakeDataChannel, rwc, func() {})
 	// we do not yet know A's peer ID so accept any inbound
-	remotePubKey, err := l.transport.noiseHandshake(ctx, pc, handshakeChannel, "", crypto.SHA256, true)
+	remotePubKey, err := l.transport.noiseHandshake(ctx, w.PeerConnection, handshakeChannel, "", crypto.SHA256, true)
 	if err != nil {
 		return nil, err
 	}
@@ -299,14 +263,28 @@ func (l *listener) setupConnection(
 	if err != nil {
 		return nil, err
 	}
-
 	// earliest point where we know the remote's peerID
 	if err := scope.SetPeer(remotePeer); err != nil {
 		return nil, err
 	}
 
-	conn.setRemotePeer(remotePeer)
-	conn.setRemotePublicKey(remotePubKey)
+	localMultiaddrWithoutCerthash, _ := ma.SplitFunc(l.localMultiaddr, func(c ma.Component) bool { return c.Protocol().Code == ma.P_CERTHASH })
+	conn, err := newConnection(
+		network.DirInbound,
+		w.PeerConnection,
+		l.transport,
+		scope,
+		l.transport.localPeerId,
+		localMultiaddrWithoutCerthash,
+		remotePeer,
+		remotePubKey,
+		remoteMultiaddr,
+		w.IncomingDataChannels,
+		w.PeerConnectionClosedCh,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	return conn, err
 }
@@ -324,7 +302,18 @@ func (l *listener) Close() error {
 	select {
 	case <-l.ctx.Done():
 	default:
-		l.cancel()
+	}
+	l.cancel()
+	l.mux.Close()
+	l.wg.Wait()
+loop:
+	for {
+		select {
+		case conn := <-l.acceptQueue:
+			conn.Close()
+		default:
+			break loop
+		}
 	}
 	return nil
 }
@@ -340,26 +329,23 @@ func (l *listener) Multiaddr() ma.Multiaddr {
 // addOnConnectionStateChangeCallback adds the OnConnectionStateChange to the PeerConnection.
 // The channel returned here:
 // * is closed when the state changes to Connection
-// * receives an error when the state changes to Failed
-// * doesn't receive anything (nor is closed) when the state changes to Disconnected
+// * receives an error when the state changes to Failed or Closed or Disconnected
 func addOnConnectionStateChangeCallback(pc *webrtc.PeerConnection) <-chan error {
 	errC := make(chan error, 1)
 	var once sync.Once
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		switch state {
+		switch pc.ConnectionState() {
 		case webrtc.PeerConnectionStateConnected:
 			once.Do(func() { close(errC) })
-		case webrtc.PeerConnectionStateFailed:
+		// PeerConnectionStateFailed happens when we fail to negotiate the connection.
+		// PeerConnectionStateDisconnected happens when we disconnect immediately after connecting.
+		// PeerConnectionStateClosed happens when we close the peer connection locally, not when remote closes. We don't need
+		// to error in this case, but it's a no-op, so it doesn't hurt.
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
 			once.Do(func() {
 				errC <- errors.New("peerconnection failed")
 				close(errC)
 			})
-		case webrtc.PeerConnectionStateDisconnected:
-			// the connection can move to a disconnected state and back to a connected state without ICE renegotiation.
-			// This could happen when underlying UDP packets are lost, and therefore the connection moves to the disconnected state.
-			// If the connection then receives packets on the connection, it can move back to the connected state.
-			// If no packets are received until the failed timeout is triggered, the connection moves to the failed state.
-			log.Warn("peerconnection disconnected")
 		}
 	})
 	return errC

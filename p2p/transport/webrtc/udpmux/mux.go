@@ -1,8 +1,11 @@
+// The udpmux package contains the logic for multiplexing multiple WebRTC (ICE)
+// connections over a single UDP socket.
 package udpmux
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,13 +14,16 @@ import (
 
 	logging "github.com/ipfs/go-log/v2"
 	pool "github.com/libp2p/go-buffer-pool"
-	"github.com/pion/ice/v2"
+	"github.com/pion/ice/v4"
 	"github.com/pion/stun"
 )
 
 var log = logging.Logger("webrtc-udpmux")
 
-const ReceiveMTU = 1500
+// ReceiveBufSize is the size of the buffer used to receive packets from the PacketConn.
+// It is fine for this number to be higher than the actual path MTU as this value is not
+// used to decide the packet size on the write path.
+const ReceiveBufSize = 1500
 
 type Candidate struct {
 	Ufrag string
@@ -134,11 +140,11 @@ func (mux *UDPMux) readLoop() {
 		default:
 		}
 
-		buf := pool.Get(ReceiveMTU)
+		buf := pool.Get(ReceiveBufSize)
 
 		n, addr, err := mux.socket.ReadFrom(buf)
 		if err != nil {
-			if strings.Contains(err.Error(), "use of closed network connection") {
+			if strings.Contains(err.Error(), "use of closed network connection") || errors.Is(err, context.Canceled) {
 				log.Debugf("readLoop exiting: socket %s closed", mux.socket.LocalAddr())
 			} else {
 				log.Errorf("error reading from socket %s: %v", mux.socket.LocalAddr(), err)
@@ -252,6 +258,9 @@ func ufragFromSTUNMessage(msg *stun.Message) (string, error) {
 	return string(attr[index+1:]), nil
 }
 
+// RemoveConnByUfrag removes the connection associated with the ufrag and all the
+// addresses associated with that connection. This method is called by pion when
+// a peerconnection is closed.
 func (mux *UDPMux) RemoveConnByUfrag(ufrag string) {
 	if ufrag == "" {
 		return

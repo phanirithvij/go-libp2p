@@ -1,6 +1,8 @@
 package libp2pwebrtc
 
 import (
+	"errors"
+	"os"
 	"sync"
 	"time"
 
@@ -9,24 +11,25 @@ import (
 	"github.com/libp2p/go-msgio/pbio"
 
 	"github.com/pion/datachannel"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 const (
 	// maxMessageSize is the maximum message size of the Protobuf message we send / receive.
 	maxMessageSize = 16384
-	// Pion SCTP association has an internal receive buffer of 1MB (roughly, 1MB per connection).
-	// We can change this value in the SettingEngine before creating the peerconnection.
-	// https://github.com/pion/webrtc/blob/v3.1.49/sctptransport.go#L341
-	maxBufferedAmount = 2 * maxMessageSize
-	// bufferedAmountLowThreshold and maxBufferedAmount are bound
-	// to a stream but congestion control is done on the whole
-	// SCTP association. This means that a single stream can monopolize
-	// the complete congestion control window (cwnd) if it does not
-	// read stream data and it's remote continues to send. We can
-	// add messages to the send buffer once there is space for 1 full
-	// sized message.
-	bufferedAmountLowThreshold = maxBufferedAmount / 2
+	// maxSendBuffer is the maximum data we enqueue on the underlying data channel for writes.
+	// The underlying SCTP layer has an unbounded buffer for writes. We limit the amount enqueued
+	// per stream is limited to avoid a single stream monopolizing the entire connection.
+	maxSendBuffer = 2 * maxMessageSize
+	// sendBufferLowThreshold is the threshold below which we write more data on the underlying
+	// data channel. We want a notification as soon as we can write 1 full sized message.
+	sendBufferLowThreshold = maxSendBuffer - maxMessageSize
+	// maxTotalControlMessagesSize is the maximum total size of all control messages we will
+	// write on this stream.
+	// 4 control messages of size 10 bytes + 10 bytes buffer. This number doesn't need to be
+	// exact. In the worst case, we enqueue these many bytes more in the webrtc peer connection
+	// send queue.
+	maxTotalControlMessagesSize = 50
 
 	// Proto overhead assumption is 5 bytes
 	protoOverhead = 5
@@ -37,6 +40,9 @@ const (
 	// is less than or equal to 2 ^ 14, the varint will not be more than
 	// 2 bytes in length.
 	varintOverhead = 2
+	// maxFINACKWait is the maximum amount of time a stream will wait to read
+	// FIN_ACK before closing the data channel
+	maxFINACKWait = 10 * time.Second
 )
 
 type receiveState uint8
@@ -52,6 +58,7 @@ type sendState uint8
 const (
 	sendStateSending sendState = iota
 	sendStateDataSent
+	sendStateDataReceived
 	sendStateReset
 )
 
@@ -59,32 +66,38 @@ const (
 // and then a network.MuxedStream
 type stream struct {
 	mx sync.Mutex
-	// pbio.Reader is not thread safe,
-	// and while our Read is not promised to be thread safe,
-	// we ourselves internally read from multiple routines...
-	reader pbio.Reader
+
+	// readerMx ensures that only a single goroutine reads from the reader. Read is not threadsafe
+	// But we may need to read from reader for control messages from a different goroutine.
+	readerMx  sync.Mutex
+	reader    pbio.Reader
+	readError error
+
 	// this buffer is limited up to a single message. Reason we need it
 	// is because a reader might read a message midway, and so we need a
 	// wait to buffer that for as long as the remaining part is not (yet) read
 	nextMessage  *pb.Message
 	receiveState receiveState
 
-	// The public Write API is not promised to be thread safe,
-	// but we need to be able to write control messages.
-	writer               pbio.Writer
-	sendStateChanged     chan struct{}
-	sendState            sendState
-	controlMsgQueue      []*pb.Message
-	writeDeadline        time.Time
-	writeDeadlineUpdated chan struct{}
-	writeAvailable       chan struct{}
+	writer            pbio.Writer // concurrent writes prevented by mx
+	writeStateChanged chan struct{}
+	sendState         sendState
+	writeDeadline     time.Time
+	writeError        error
 
-	readLoopOnce sync.Once
+	controlMessageReaderOnce sync.Once
+	// controlMessageReaderEndTime is the end time for reading FIN_ACK from the control
+	// message reader. We cannot rely on SetReadDeadline to do this since that is prone to
+	// race condition where a previous deadline timer fires after the latest call to
+	// SetReadDeadline
+	// See: https://github.com/pion/sctp/pull/290
+	controlMessageReaderEndTime time.Time
 
-	onDone      func()
-	id          uint16 // for logging purposes
-	dataChannel *datachannel.DataChannel
-	closeErr    error
+	onDoneOnce          sync.Once
+	onDone              func()
+	id                  uint16 // for logging purposes
+	dataChannel         *datachannel.DataChannel
+	closeForShutdownErr error
 }
 
 var _ network.MuxedStream = &stream{}
@@ -95,76 +108,72 @@ func newStream(
 	onDone func(),
 ) *stream {
 	s := &stream{
-		reader: pbio.NewDelimitedReader(rwc, maxMessageSize),
-		writer: pbio.NewDelimitedWriter(rwc),
-
-		sendStateChanged:     make(chan struct{}, 1),
-		writeDeadlineUpdated: make(chan struct{}, 1),
-		writeAvailable:       make(chan struct{}, 1),
-
-		id:          *channel.ID(),
-		dataChannel: rwc.(*datachannel.DataChannel),
-		onDone:      onDone,
+		reader:            pbio.NewDelimitedReader(rwc, maxMessageSize),
+		writer:            pbio.NewDelimitedWriter(rwc),
+		writeStateChanged: make(chan struct{}, 1),
+		id:                *channel.ID(),
+		dataChannel:       rwc.(*datachannel.DataChannel),
+		onDone:            onDone,
 	}
+	s.dataChannel.SetBufferedAmountLowThreshold(sendBufferLowThreshold)
+	s.dataChannel.OnBufferedAmountLow(func() {
+		s.notifyWriteStateChanged()
 
-	channel.SetBufferedAmountLowThreshold(bufferedAmountLowThreshold)
-	channel.OnBufferedAmountLow(func() {
-		s.mx.Lock()
-		defer s.mx.Unlock()
-		// first send out queued control messages
-		for len(s.controlMsgQueue) > 0 {
-			msg := s.controlMsgQueue[0]
-			available := s.availableSendSpace()
-			if controlMsgSize < available {
-				s.writer.WriteMsg(msg) // TODO: handle error
-				s.controlMsgQueue = s.controlMsgQueue[1:]
-			} else {
-				return
-			}
-		}
-
-		if s.isDone() {
-			// onDone removes the stream from the connection and requires the connection lock.
-			// This callback(onBufferedAmountLow) is executing in the sctp readLoop goroutine.
-			// If Connection.Close is called concurrently, the closing goroutine will acquire
-			// the connection lock and wait for sctp readLoop to exit, the sctp readLoop will
-			// wait for the connection lock before exiting, causing a deadlock.
-			// Run this in a different goroutine to avoid the deadlock.
-			go func() {
-				s.mx.Lock()
-				defer s.mx.Unlock()
-				// TODO: we should be closing the underlying datachannel, but this resets the stream
-				// See https://github.com/libp2p/specs/issues/575 for details.
-				// _ = s.dataChannel.Close()
-				// TODO: write for the spawned reader to return
-				s.onDone()
-			}()
-		}
-
-		select {
-		case s.writeAvailable <- struct{}{}:
-		default:
-		}
 	})
 	return s
 }
 
 func (s *stream) Close() error {
+	s.mx.Lock()
+	isClosed := s.closeForShutdownErr != nil
+	s.mx.Unlock()
+	if isClosed {
+		return nil
+	}
+	defer s.cleanup()
 	closeWriteErr := s.CloseWrite()
 	closeReadErr := s.CloseRead()
-	if closeWriteErr != nil {
-		return closeWriteErr
+	if closeWriteErr != nil || closeReadErr != nil {
+		s.Reset()
+		return errors.Join(closeWriteErr, closeReadErr)
 	}
-	return closeReadErr
+
+	s.mx.Lock()
+	if s.controlMessageReaderEndTime.IsZero() {
+		s.controlMessageReaderEndTime = time.Now().Add(maxFINACKWait)
+		s.setDataChannelReadDeadline(time.Now().Add(-1 * time.Hour))
+	}
+	s.mx.Unlock()
+	return nil
 }
 
 func (s *stream) Reset() error {
-	cancelWriteErr := s.cancelWrite()
-	closeReadErr := s.CloseRead()
-	if cancelWriteErr != nil {
-		return cancelWriteErr
+	return s.ResetWithError(0)
+}
+
+func (s *stream) ResetWithError(errCode network.StreamErrorCode) error {
+	s.mx.Lock()
+	isClosed := s.closeForShutdownErr != nil
+	s.mx.Unlock()
+	if isClosed {
+		return nil
 	}
-	return closeReadErr
+
+	defer s.cleanup()
+	cancelWriteErr := s.cancelWrite(errCode)
+	closeReadErr := s.closeRead(errCode, false)
+	s.setDataChannelReadDeadline(time.Now().Add(-1 * time.Hour))
+	return errors.Join(closeReadErr, cancelWriteErr)
+}
+
+func (s *stream) closeForShutdown(closeErr error) {
+	defer s.cleanup()
+
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	s.closeForShutdownErr = closeErr
+	s.notifyWriteStateChanged()
 }
 
 func (s *stream) SetDeadline(t time.Time) error {
@@ -172,60 +181,113 @@ func (s *stream) SetDeadline(t time.Time) error {
 	return s.SetWriteDeadline(t)
 }
 
-// processIncomingFlag process the flag on an incoming message
-// It needs to be called with msg.Flag, not msg.GetFlag(),
-// otherwise we'd misinterpret the default value.
+// processIncomingFlag processes the flag(FIN/RST/etc) on msg.
 // It needs to be called while the mutex is locked.
-func (s *stream) processIncomingFlag(flag *pb.Message_Flag) {
-	if flag == nil {
+func (s *stream) processIncomingFlag(msg *pb.Message) {
+	if msg.Flag == nil {
 		return
 	}
 
-	switch *flag {
+	switch msg.GetFlag() {
+	case pb.Message_STOP_SENDING:
+		// We must process STOP_SENDING after sending a FIN(sendStateDataSent). Remote peer
+		// may not send a FIN_ACK once it has sent a STOP_SENDING
+		if s.sendState == sendStateSending || s.sendState == sendStateDataSent {
+			s.sendState = sendStateReset
+			s.writeError = &network.StreamError{Remote: true, ErrorCode: network.StreamErrorCode(msg.GetErrorCode())}
+		}
+		s.notifyWriteStateChanged()
+	case pb.Message_FIN_ACK:
+		s.sendState = sendStateDataReceived
+		s.notifyWriteStateChanged()
 	case pb.Message_FIN:
 		if s.receiveState == receiveStateReceiving {
 			s.receiveState = receiveStateDataRead
 		}
-	case pb.Message_STOP_SENDING:
-		if s.sendState == sendStateSending {
-			s.sendState = sendStateReset
+		if err := s.writer.WriteMsg(&pb.Message{Flag: pb.Message_FIN_ACK.Enum()}); err != nil {
+			log.Debugf("failed to send FIN_ACK: %s", err)
+			// Remote has finished writing all the data It'll stop waiting for the
+			// FIN_ACK eventually or will be notified when we close the datachannel
 		}
-		select {
-		case s.sendStateChanged <- struct{}{}:
-		default:
-		}
+		s.spawnControlMessageReader()
 	case pb.Message_RESET:
 		if s.receiveState == receiveStateReceiving {
 			s.receiveState = receiveStateReset
+			s.readError = &network.StreamError{Remote: true, ErrorCode: network.StreamErrorCode(msg.GetErrorCode())}
 		}
-	}
-	s.maybeDeclareStreamDone()
-}
-
-// maybeDeclareStreamDone is used to force reset a stream. It should be called with
-// the stream lock acquired. It calls stream.onDone which requires the connection lock.
-func (s *stream) maybeDeclareStreamDone() {
-	if s.isDone() {
-		_ = s.SetReadDeadline(time.Now().Add(-1 * time.Hour)) // pion ignores zero times
-		// TODO: we should be closing the underlying datachannel, but this resets the stream
-		// See https://github.com/libp2p/specs/issues/575 for details.
-		// _ = s.dataChannel.Close()
-		// TODO: write for the spawned reader to return
-		s.onDone()
+		if s.sendState == sendStateSending || s.sendState == sendStateDataSent {
+			s.sendState = sendStateReset
+			s.writeError = &network.StreamError{Remote: true, ErrorCode: network.StreamErrorCode(msg.GetErrorCode())}
+		}
+		s.spawnControlMessageReader()
 	}
 }
 
-// isDone indicates whether the stream is completed and all the control messages have also been
-// flushed. It must be called with the stream lock acquired.
-func (s *stream) isDone() bool {
-	return (s.sendState == sendStateReset || s.sendState == sendStateDataSent) &&
-		(s.receiveState == receiveStateReset || s.receiveState == receiveStateDataRead) &&
-		len(s.controlMsgQueue) == 0
+// spawnControlMessageReader is used for processing control messages after the reader is closed.
+func (s *stream) spawnControlMessageReader() {
+	s.controlMessageReaderOnce.Do(func() {
+		// Spawn a goroutine to ensure that we're not holding any locks
+		go func() {
+			// cleanup the sctp deadline timer goroutine
+			defer s.setDataChannelReadDeadline(time.Time{})
+
+			defer s.dataChannel.Close()
+
+			// Unblock any Read call waiting on reader.ReadMsg
+			s.setDataChannelReadDeadline(time.Now().Add(-1 * time.Hour))
+
+			s.readerMx.Lock()
+			// We have the lock: any readers blocked on reader.ReadMsg have exited.
+			s.mx.Lock()
+			defer s.mx.Unlock()
+			// From this point onwards only this goroutine will do reader.ReadMsg.
+			// We just wanted to ensure any exising readers have exited.
+			// Read calls from this point onwards will exit immediately on checking
+			// s.readState
+			s.readerMx.Unlock()
+
+			if s.nextMessage != nil {
+				s.processIncomingFlag(s.nextMessage)
+				s.nextMessage = nil
+			}
+			var msg pb.Message
+			for {
+				// Connection closed. No need to cleanup the data channel.
+				if s.closeForShutdownErr != nil {
+					return
+				}
+				// Write half of the stream completed.
+				if s.sendState == sendStateDataReceived || s.sendState == sendStateReset {
+					return
+				}
+				// FIN_ACK wait deadling exceeded.
+				if !s.controlMessageReaderEndTime.IsZero() && time.Now().After(s.controlMessageReaderEndTime) {
+					return
+				}
+
+				s.setDataChannelReadDeadline(s.controlMessageReaderEndTime)
+				s.mx.Unlock()
+				err := s.reader.ReadMsg(&msg)
+				s.mx.Lock()
+				if err != nil {
+					// We have to manually manage deadline exceeded errors since pion/sctp can
+					// return deadline exceeded error for cancelled deadlines
+					// see: https://github.com/pion/sctp/pull/290/files
+					if errors.Is(err, os.ErrDeadlineExceeded) {
+						continue
+					}
+					return
+				}
+				s.processIncomingFlag(&msg)
+			}
+		}()
+	})
 }
 
-func (s *stream) setCloseError(e error) {
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	s.closeErr = e
+func (s *stream) cleanup() {
+	s.onDoneOnce.Do(func() {
+		if s.onDone != nil {
+			s.onDone()
+		}
+	})
 }

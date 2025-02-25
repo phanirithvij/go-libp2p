@@ -26,6 +26,7 @@ import (
 
 	ma "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
+	matest "github.com/multiformats/go-multiaddr/matest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,9 +54,9 @@ func TestAddrsForDial(t *testing.T) {
 	ps.AddPrivKey(id, priv)
 	t.Cleanup(func() { ps.Close() })
 
-	tpt, err := websocket.New(nil, &network.NullResourceManager{})
+	tpt, err := websocket.New(nil, &network.NullResourceManager{}, nil)
 	require.NoError(t, err)
-	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(resolver))
+	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(ResolverFromMaDNS{resolver}))
 	require.NoError(t, err)
 	defer s.Close()
 	err = s.AddTransport(tpt)
@@ -96,11 +97,11 @@ func TestDedupAddrsForDial(t *testing.T) {
 	ps.AddPrivKey(id, priv)
 	t.Cleanup(func() { ps.Close() })
 
-	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(resolver))
+	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(ResolverFromMaDNS{resolver}))
 	require.NoError(t, err)
 	defer s.Close()
 
-	tpt, err := tcp.NewTCPTransport(nil, &network.NullResourceManager{})
+	tpt, err := tcp.NewTCPTransport(nil, &network.NullResourceManager{}, nil)
 	require.NoError(t, err)
 	err = s.AddTransport(tpt)
 	require.NoError(t, err)
@@ -114,7 +115,7 @@ func TestDedupAddrsForDial(t *testing.T) {
 	mas, _, err := s.addrsForDial(ctx, otherPeer)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, len(mas))
+	require.Len(t, mas, 1)
 }
 
 func newTestSwarmWithResolver(t *testing.T, resolver *madns.Resolver) *Swarm {
@@ -127,14 +128,14 @@ func newTestSwarmWithResolver(t *testing.T, resolver *madns.Resolver) *Swarm {
 	ps.AddPubKey(id, priv.GetPublic())
 	ps.AddPrivKey(id, priv)
 	t.Cleanup(func() { ps.Close() })
-	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(resolver))
+	s, err := NewSwarm(id, ps, eventbus.NewBus(), WithMultiaddrResolver(ResolverFromMaDNS{resolver}))
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		s.Close()
 	})
 
 	// Add a tcp transport so that we know we can dial a tcp multiaddr and we don't filter it out.
-	tpt, err := tcp.NewTCPTransport(nil, &network.NullResourceManager{})
+	tpt, err := tcp.NewTCPTransport(nil, &network.NullResourceManager{}, nil)
 	require.NoError(t, err)
 	err = s.AddTransport(tpt)
 	require.NoError(t, err)
@@ -151,7 +152,7 @@ func newTestSwarmWithResolver(t *testing.T, resolver *madns.Resolver) *Swarm {
 	err = s.AddTransport(wtTpt)
 	require.NoError(t, err)
 
-	wsTpt, err := websocket.New(nil, &network.NullResourceManager{})
+	wsTpt, err := websocket.New(nil, &network.NullResourceManager{}, nil)
 	require.NoError(t, err)
 	err = s.AddTransport(wsTpt)
 	require.NoError(t, err)
@@ -188,12 +189,12 @@ func TestAddrResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, mas, 1)
-	require.Contains(t, mas, addr2)
+	matest.AssertMultiaddrsContain(t, mas, addr2)
 
 	addrs := s.peers.Addrs(p1)
 	require.Len(t, addrs, 2)
-	require.Contains(t, addrs, addr1)
-	require.Contains(t, addrs, addr2)
+	matest.AssertMultiaddrsContain(t, addrs, addr1)
+	matest.AssertMultiaddrsContain(t, addrs, addr2)
 }
 
 func TestAddrResolutionRecursive(t *testing.T) {
@@ -234,8 +235,8 @@ func TestAddrResolutionRecursive(t *testing.T) {
 
 	addrs1 := s.Peerstore().Addrs(pi1.ID)
 	require.Len(t, addrs1, 2)
-	require.Contains(t, addrs1, addr1)
-	require.Contains(t, addrs1, addr2)
+	matest.AssertMultiaddrsContain(t, addrs1, addr1)
+	matest.AssertMultiaddrsContain(t, addrs1, addr2)
 
 	pi2, err := peer.AddrInfoFromP2pAddr(p2paddr2)
 	require.NoError(t, err)
@@ -247,7 +248,7 @@ func TestAddrResolutionRecursive(t *testing.T) {
 
 	addrs2 := s.Peerstore().Addrs(pi2.ID)
 	require.Len(t, addrs2, 1)
-	require.Contains(t, addrs2, addr1)
+	matest.AssertMultiaddrsContain(t, addrs2, addr1)
 }
 
 // see https://github.com/libp2p/go-libp2p/issues/2562
@@ -275,7 +276,7 @@ func TestAddrResolutionRecursiveTransportSpecific(t *testing.T) {
 	addrs, _, err := s.addrsForDial(tctx, p)
 	require.NoError(t, err)
 	require.Len(t, addrs, 1)
-	require.Equal(t, addrs[0].String(), "/ip4/1.2.3.4/tcp/443/tls/sni/sub.example.com/ws")
+	require.Equal(t, "/ip4/1.2.3.4/tcp/443/tls/sni/sub.example.com/ws", addrs[0].String())
 }
 
 func TestAddrsForDialFiltering(t *testing.T) {
@@ -364,10 +365,11 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 	defer s.Close()
 
 	n := 3
-	s.bhd.ipv6 = &blackHoleFilter{n: n, minSuccesses: 1, name: "IPv6"}
+	s.bhd.ipv6 = &BlackHoleSuccessCounter{N: n, MinSuccesses: 1, Name: "IPv6"}
 
-	// all dials to the address will fail. RFC6666 Discard Prefix
-	addr := ma.StringCast("/ip6/0100::1/tcp/54321/")
+	// All dials to this addr will fail.
+	// manet.IsPublic is aggressive for IPv6 addresses. Use a NAT64 address.
+	addr := ma.StringCast("/ip6/64:ff9b::1.2.3.4/tcp/54321/")
 
 	p, err := test.RandPeerID()
 	if err != nil {
@@ -396,4 +398,34 @@ func TestBlackHoledAddrBlocked(t *testing.T) {
 		t.Fatalf("expected to receive an error of type *DialError, got %s of type %T", err, err)
 	}
 	require.ErrorIs(t, err, ErrDialRefusedBlackHole)
+}
+
+type mockDNSResolver struct {
+	ipsToReturn  []net.IPAddr
+	txtsToReturn []string
+}
+
+var _ madns.BasicResolver = (*mockDNSResolver)(nil)
+
+func (m *mockDNSResolver) LookupIPAddr(_ context.Context, _ string) ([]net.IPAddr, error) {
+	return m.ipsToReturn, nil
+}
+
+func (m *mockDNSResolver) LookupTXT(_ context.Context, _ string) ([]string, error) {
+	return m.txtsToReturn, nil
+}
+
+func TestSkipDialingManyDNS(t *testing.T) {
+	resolver, err := madns.NewResolver(madns.WithDefaultResolver(&mockDNSResolver{ipsToReturn: []net.IPAddr{{IP: net.ParseIP("1.2.3.4")}, {IP: net.ParseIP("1.2.3.5")}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestSwarmWithResolver(t, resolver)
+	defer s.Close()
+	id := test.RandPeerIDFatal(t)
+	addr := ma.StringCast("/dns/example.com/udp/1234/p2p-circuit/dns/example.com/p2p-circuit/dns/example.com")
+
+	resolved := s.resolveAddrs(context.Background(), peer.AddrInfo{ID: id, Addrs: []ma.Multiaddr{addr}})
+	require.NoError(t, err)
+	require.Less(t, len(resolved), 3)
 }

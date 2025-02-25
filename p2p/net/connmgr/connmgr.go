@@ -175,7 +175,8 @@ func (cm *BasicConnMgr) memoryEmergency() {
 	// Trim connections without paying attention to the silence period.
 	for _, c := range cm.getConnsToCloseEmergency(target) {
 		log.Infow("low on memory. closing conn", "peer", c.RemotePeer())
-		c.Close()
+
+		c.CloseWithError(network.ConnGarbageCollected)
 	}
 
 	// finally, update the last trim time.
@@ -388,7 +389,7 @@ func (cm *BasicConnMgr) trim() {
 	// do the actual trim.
 	for _, c := range cm.getConnsToClose() {
 		log.Debugw("closing conn", "peer", c.RemotePeer())
-		c.Close()
+		c.CloseWithError(network.ConnGarbageCollected)
 	}
 }
 
@@ -592,7 +593,7 @@ func (cm *BasicConnMgr) UntagPeer(p peer.ID, tag string) {
 
 	pi, ok := s.peers[p]
 	if !ok {
-		log.Info("tried to remove tag from untracked peer: ", p)
+		log.Debug("tried to remove tag from untracked peer: ", p, tag)
 		return
 	}
 

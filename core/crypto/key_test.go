@@ -8,6 +8,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"fmt"
 	"reflect"
@@ -16,7 +17,6 @@ import (
 	. "github.com/libp2p/go-libp2p/core/crypto"
 	pb "github.com/libp2p/go-libp2p/core/crypto/pb"
 	"github.com/libp2p/go-libp2p/core/test"
-	"github.com/libp2p/go-libp2p/internal/sha256"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -289,17 +289,5 @@ func testKeyEquals(t *testing.T, k Key) {
 
 	if KeyEqual(k, pk) {
 		t.Fatal("Keys should not equal.")
-	}
-}
-
-func TestUnknownCurveErrors(t *testing.T) {
-	_, _, err := GenerateEKeyPair("P-256")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, _, err = GenerateEKeyPair("error-please")
-	if err == nil {
-		t.Fatal("expected invalid key type to error")
 	}
 }
