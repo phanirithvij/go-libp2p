@@ -190,6 +190,73 @@ func TestPeerLimits(t *testing.T) {
 	require.Equal(t, 1024, ab.addrs.NumUnconnectedAddrs())
 }
 
+// TestMaxAddrsPerPeerEvictsNearestExpiry verifies the per-peer cap evicts
+// the stored addr with the soonest expiry first, not just the oldest insert.
+func TestMaxAddrsPerPeerEvictsNearestExpiry(t *testing.T) {
+	ab := NewAddrBook(WithMaxAddressesPerPeer(3))
+	defer ab.Close()
+
+	const p = peer.ID("peer-cap")
+	a1 := ma.StringCast("/ip4/1.2.3.4/tcp/1")
+	a2 := ma.StringCast("/ip4/1.2.3.4/tcp/2")
+	a3 := ma.StringCast("/ip4/1.2.3.4/tcp/3")
+	a4 := ma.StringCast("/ip4/1.2.3.4/tcp/4")
+
+	ab.AddAddr(p, a1, time.Hour)      // furthest expiry
+	ab.AddAddr(p, a2, 30*time.Minute) // middle
+	ab.AddAddr(p, a3, 10*time.Minute) // nearest expiry, will be evicted first
+	require.ElementsMatch(t, []ma.Multiaddr{a1, a2, a3}, ab.Addrs(p))
+
+	// Adding a fourth addr forces eviction; a3 (nearest expiry) must go.
+	ab.AddAddr(p, a4, 45*time.Minute)
+	require.ElementsMatch(t, []ma.Multiaddr{a1, a2, a4}, ab.Addrs(p))
+}
+
+// TestMaxAddrsPerPeerEnforcedOnSetAddrs verifies the per-peer cap fires on
+// the SetAddrs path too, not only AddAddr.
+func TestMaxAddrsPerPeerEnforcedOnSetAddrs(t *testing.T) {
+	ab := NewAddrBook(WithMaxAddressesPerPeer(2))
+	defer ab.Close()
+
+	const p = peer.ID("peer-setaddrs")
+	a1 := ma.StringCast("/ip4/1.2.3.4/tcp/1")
+	a2 := ma.StringCast("/ip4/1.2.3.4/tcp/2")
+	a3 := ma.StringCast("/ip4/1.2.3.4/tcp/3")
+
+	ab.AddAddr(p, a1, time.Hour)      // furthest expiry
+	ab.AddAddr(p, a2, 10*time.Minute) // nearest expiry, eviction target
+	require.ElementsMatch(t, []ma.Multiaddr{a1, a2}, ab.Addrs(p))
+
+	// SetAddrs with a new addr hits the cap; nearest-expiry a2 must go.
+	ab.SetAddrs(p, []ma.Multiaddr{a3}, 30*time.Minute)
+	require.ElementsMatch(t, []ma.Multiaddr{a1, a3}, ab.Addrs(p))
+}
+
+// TestMaxAddrsPerPeerDoesNotEvictConnected verifies that addrs held by live
+// connections (TTL >= ConnectedAddrTTL) are neither counted toward the cap
+// nor eligible for eviction.
+func TestMaxAddrsPerPeerDoesNotEvictConnected(t *testing.T) {
+	ab := NewAddrBook(WithMaxAddressesPerPeer(2))
+	defer ab.Close()
+
+	const p = peer.ID("peer-connected")
+	live := ma.StringCast("/ip4/1.2.3.4/tcp/1")
+	a1 := ma.StringCast("/ip4/1.2.3.4/tcp/2")
+	a2 := ma.StringCast("/ip4/1.2.3.4/tcp/3")
+	a3 := ma.StringCast("/ip4/1.2.3.4/tcp/4")
+
+	// Pin one addr via ConnectedAddrTTL. It should not count toward the cap.
+	ab.AddAddr(p, live, peerstore.ConnectedAddrTTL)
+	ab.AddAddr(p, a1, 10*time.Minute)
+	ab.AddAddr(p, a2, 20*time.Minute)
+	require.ElementsMatch(t, []ma.Multiaddr{live, a1, a2}, ab.Addrs(p))
+
+	// Adding a third unconnected addr must evict an unconnected one
+	// (a1 has the soonest expiry), never the connected addr.
+	ab.AddAddr(p, a3, 30*time.Minute)
+	require.ElementsMatch(t, []ma.Multiaddr{live, a2, a3}, ab.Addrs(p))
+}
+
 // TestConsumePeerRecordReplacesStaleAddrs verifies replace-semantics on a
 // newer signed peer record: addrs dropped from the new record are evicted,
 // while unsigned addrs and addrs held by a live connection are kept.

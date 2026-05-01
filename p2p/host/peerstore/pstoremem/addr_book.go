@@ -167,6 +167,12 @@ func (rc realclock) Now() time.Time {
 const (
 	defaultMaxSignedPeerRecords = 100_000
 	defaultMaxUnconnectedAddrs  = 1_000_000
+	// defaultMaxAddrsPerPeer caps the unconnected addresses stored per
+	// peer. Sized well above observed real-world maxima (~26 for
+	// well-connected multi-transport nodes) to leave honest peers
+	// untouched while bounding DHT pollution from third parties gossiping
+	// stale or misconfigured peerstore contents.
+	defaultMaxAddrsPerPeer = 64
 )
 
 // memoryAddrBook manages addresses.
@@ -176,6 +182,7 @@ type memoryAddrBook struct {
 	signedPeerRecords    map[peer.ID]*peerRecordState
 	maxUnconnectedAddrs  int
 	maxSignedPeerRecords int
+	maxAddrsPerPeer      int
 
 	refCount sync.WaitGroup
 	cancel   func()
@@ -198,6 +205,7 @@ func NewAddrBook(opts ...AddrBookOption) *memoryAddrBook {
 		clock:                realclock{},
 		maxUnconnectedAddrs:  defaultMaxUnconnectedAddrs,
 		maxSignedPeerRecords: defaultMaxSignedPeerRecords,
+		maxAddrsPerPeer:      defaultMaxAddrsPerPeer,
 	}
 	for _, opt := range opts {
 		opt(ab)
@@ -230,6 +238,18 @@ func WithMaxAddresses(n int) AddrBookOption {
 func WithMaxSignedPeerRecords(n int) AddrBookOption {
 	return func(b *memoryAddrBook) error {
 		b.maxSignedPeerRecords = n
+		return nil
+	}
+}
+
+// WithMaxAddressesPerPeer caps the unconnected addresses stored per peer.
+// When the cap is full, adding a new addr evicts the unconnected entry
+// with the nearest expiry. Addresses held by a live connection
+// (TTL >= ConnectedAddrTTL) bypass the cap and survive eviction. Pass 0
+// or a negative value to disable the cap. Defaults to 64.
+func WithMaxAddressesPerPeer(n int) AddrBookOption {
+	return func(b *memoryAddrBook) error {
+		b.maxAddrsPerPeer = n
 		return nil
 	}
 }
@@ -392,6 +412,43 @@ func (mab *memoryAddrBook) maybeDeleteSignedPeerRecordUnlocked(p peer.ID) {
 	}
 }
 
+// numUnconnectedAddrsForPeerUnlocked returns how many of p's stored addrs
+// are not held by a live connection.
+func (mab *memoryAddrBook) numUnconnectedAddrsForPeerUnlocked(p peer.ID) int {
+	n := 0
+	for _, a := range mab.addrs.Addrs[p] {
+		if !a.IsConnected() {
+			n++
+		}
+	}
+	return n
+}
+
+// evictNearestExpiryUnconnectedForPeerUnlocked drops p's unconnected addr
+// with the earliest expiry. Returns false when every remaining addr for p
+// is held by a live connection; the caller must then drop the incoming
+// addr.
+//
+// Shorter-TTL entries (e.g. DHT gossip at TempAddrTTL) expire sooner than
+// identify-written peer-vouched addrs (RecentlyConnectedAddrTTL), so the
+// rule sheds gossip first without classifying sources.
+func (mab *memoryAddrBook) evictNearestExpiryUnconnectedForPeerUnlocked(p peer.ID) bool {
+	var victim *expiringAddr
+	for _, a := range mab.addrs.Addrs[p] {
+		if a.IsConnected() {
+			continue
+		}
+		if victim == nil || a.Expiry.Before(victim.Expiry) {
+			victim = a
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	mab.addrs.Delete(victim)
+	return true
+}
+
 func (mab *memoryAddrBook) addAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Duration) {
 	mab.mu.Lock()
 	defer mab.mu.Unlock()
@@ -426,6 +483,15 @@ func (mab *memoryAddrBook) addAddrsUnlocked(p peer.ID, addrs []ma.Multiaddr, ttl
 		}
 		a, found := mab.addrs.FindAddr(p, addr)
 		if !found {
+			// Enforce the per-peer cap on unconnected addrs. Entries held
+			// by a live connection are not counted. A non-positive cap
+			// disables the check.
+			if mab.maxAddrsPerPeer > 0 && !ttlIsConnected(ttl) && mab.numUnconnectedAddrsForPeerUnlocked(p) >= mab.maxAddrsPerPeer {
+				if !mab.evictNearestExpiryUnconnectedForPeerUnlocked(p) {
+					// Every existing addr is protected; drop the new one.
+					continue
+				}
+			}
 			// not found, announce it.
 			entry := &expiringAddr{Addr: addr, Expiry: exp, TTL: ttl, Peer: p}
 			mab.addrs.Insert(entry)
@@ -491,6 +557,13 @@ func (mab *memoryAddrBook) SetAddrs(p peer.ID, addrs []ma.Multiaddr, ttl time.Du
 			if ttl > 0 {
 				if !ttlIsConnected(ttl) && mab.addrs.NumUnconnectedAddrs() >= mab.maxUnconnectedAddrs {
 					continue
+				}
+				// Same per-peer cap check as addAddrsUnlocked: bound
+				// how many unconnected addrs we keep for one peer.
+				if mab.maxAddrsPerPeer > 0 && !ttlIsConnected(ttl) && mab.numUnconnectedAddrsForPeerUnlocked(p) >= mab.maxAddrsPerPeer {
+					if !mab.evictNearestExpiryUnconnectedForPeerUnlocked(p) {
+						continue
+					}
 				}
 				entry := &expiringAddr{Addr: addr, Expiry: exp, TTL: ttl, Peer: p}
 				mab.addrs.Insert(entry)
